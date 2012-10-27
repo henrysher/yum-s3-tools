@@ -164,6 +164,7 @@ class S3Grabber(object):
                 filename = request.get_selector()
                 if filename.startswith('/'):
                     filename = filename[1:]
+            print os.path.basename(filename)
             response = None
             try:
                 out = open(filename, 'w+')

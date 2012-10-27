@@ -30,6 +30,9 @@ cp -v src/s3iam.py  ${RPM_BUILD_ROOT}/usr/lib/yum-plugins/
 %clean
 rm -rf "${RPM_BUILD_ROOT}"
 
+%postun
+find /usr/lib/yum-plugins/ -name "s3iam.py*" | xargs rm -fv
+
 %files
 %defattr(-,root,root,-)
 /etc/yum.repos.d/s3iam.repo

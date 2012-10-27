@@ -17,7 +17,8 @@
 ;
 [s3iam]
 name=S3 yum plugin test repository config
-baseurl=http://your-bucket-name.s3.amazonaws.com/
+baseurl=http://your-bucket-name-1.s3.amazonaws.com/repo-name/arch/
+        http://your-bucket-name-2.s3.amazonaws.com/repo-name/arch/
 failovermethod=priority
 enabled=1
 s3_enabled=1

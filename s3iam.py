@@ -59,9 +59,15 @@ def init_hook(conduit):
         if isinstance(repo, YumRepository) and repo.s3_enabled and repo.enabled:
             new_repo = S3Repository(repo.id, repo.baseurl)
             new_repo.name = repo.name
+            new_repo.basecachedir = repo.basecachedir
+            new_repo.mirrorlist = repo.mirrorlist
+            new_repo.base_persistdir = repo.base_persistdir
+            new_repo.gpgcheck = repo.gpgcheck
+            new_repo.proxy = repo.proxy
+            new_repo = S3Repository(repo.id, repo.baseurl)
+            new_repo.name = repo.name
             repos.delete(key)
             repos.add(new_repo)
-
 
 class S3Repository(YumRepository):
     """Repository object for Amazon S3, using IAM Roles."""
@@ -90,18 +96,17 @@ class S3Grabber(object):
 
     def __init__(self, repo):
         """Initialize file grabber.
-        Note: currently supports only single repo.baseurl. So in case of a list
-              only the first item will be used.
+           FIXME: cannot show the correct baseurl in use.
         """
         if isinstance(repo.baseurl, basestring):
-            self.baseurl = baseurl
+            self.baseurl = [baseurl]
         else:
-            if len(repo.baseurl) != 1:
+            if len(repo.baseurl) == 0:
                 raise yum.plugins.PluginYumExit("s3iam: repository '{0}' "
                                                 "must have only one "
                                                 "'baseurl' value" % repo.id)
             else:
-                self.baseurl = repo.baseurl[0]
+                self.baseurl = repo.baseurl
 
     def get_role(self):
         """Read IAM role from AWS metadata store."""
@@ -143,8 +148,8 @@ class S3Grabber(object):
         self.secret_key = data['SecretAccessKey']
         self.token = data['Token']
 
-    def _request(self, path):
-        url = urlparse.urljoin(self.baseurl, path)
+    def _request(self, baseurl, path):
+        url = urlparse.urljoin(baseurl, path)
         request = urllib2.Request(url)
         request.add_header('x-amz-security-token', self.token)
         signature = self.sign(request)
@@ -155,24 +160,24 @@ class S3Grabber(object):
 
     def urlgrab(self, url, filename=None, **kwargs):
         """urlgrab(url) copy the file to the local filesystem."""
-        request = self._request(url)
-        if filename is None:
-            filename = req.get_selector()
-            if filename.startswith('/'):
-                filename = filename[1:]
-
-        response = None
-        try:
-            out = open(filename, 'w+')
-            response = urllib2.urlopen(request)
-            buff = response.read(8192)
-            while buff:
-                out.write(buff)
+        for baseurl in self.baseurl:
+            request = self._request(baseurl, url)
+            if filename is None:
+                filename = request.get_selector()
+                if filename.startswith('/'):
+                    filename = filename[1:]
+            response = None
+            try:
+                out = open(filename, 'w+')
+                response = urllib2.urlopen(request)
                 buff = response.read(8192)
-        finally:
-            if response:
-                response.close()
-            out.close()
+                while buff:
+                    out.write(buff)
+                    buff = response.read(8192)
+            finally:
+                if response:
+                    response.close()
+                out.close()
 
         return filename
 

@@ -60,12 +60,10 @@ def init_hook(conduit):
             new_repo = S3Repository(repo.id, repo.baseurl)
             new_repo.name = repo.name
             new_repo.basecachedir = repo.basecachedir
-            new_repo.mirrorlist = repo.mirrorlist
             new_repo.base_persistdir = repo.base_persistdir
             new_repo.gpgcheck = repo.gpgcheck
             new_repo.proxy = repo.proxy
-            new_repo = S3Repository(repo.id, repo.baseurl)
-            new_repo.name = repo.name
+            new_repo.enablegroups = repo.enablegroups
             repos.delete(key)
             repos.add(new_repo)
 
@@ -174,12 +172,14 @@ class S3Grabber(object):
                 while buff:
                     out.write(buff)
                     buff = response.read(8192)
+            except:
+                continue
             finally:
                 if response:
                     response.close()
                 out.close()
 
-        return filename
+            return filename
 
     def urlopen(self, url, **kwargs):
         """urlopen(url) open the remote file and return a file object."""

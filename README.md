@@ -37,6 +37,7 @@ Apache 2.0 license. See LICENSE.
 
 ## Author(s)
 
+- Henry Huang
 - Julius Seporaitis
 - [Robert Melas' code](https://github.com/rmela/yum-s3-plugin/) was
   used as a reference. See NOTICE.

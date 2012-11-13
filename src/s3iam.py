@@ -38,6 +38,7 @@ import yum.plugins
 
 from yum.yumRepo import YumRepository
 
+CONFIG_PATH = "/etc/s3yum.cfg"
 
 __all__ = ['requires_api_version', 'plugin_type', 'CONDUIT',
            'config_hook', 'init_hook']
@@ -73,6 +74,7 @@ class S3Repository(YumRepository):
     def __init__(self, repoid, baseurl):
         super(S3Repository, self).__init__(repoid)
         self.iamrole = None
+        self.token = None
         self.baseurl = baseurl
         self.grabber = None
         self.enable()
@@ -85,8 +87,11 @@ class S3Repository(YumRepository):
     def grab(self):
         if not self.grabber:
             self.grabber = S3Grabber(self)
-            self.grabber.get_role()
-            self.grabber.get_credentials()
+            if not self.grabber.get_role():
+                if not self.grabber.get_credentials_from_config():
+                    raise Exception("Failed to get credentials from config file: %s" % CONFIG_PATH)
+            else:
+                self.grabber.get_credentials_from_iamrole()
         return self.grabber
 
 
@@ -118,11 +123,48 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             self.iamrole = (response.read())
+        except Exception as msg:
+            if "HTTP Error 404" in msg:
+                return False
         finally:
             if response:
                 response.close()
+                return True
 
-    def get_credentials(self):
+    def get_credentials_from_config(self):
+        """Read S3 credentials from Local Configuration.
+        Note: This method should be explicitly called after constructing new
+              object, as in 'explicit is better than implicit'.
+        """
+        import ConfigParser
+        configInfo = {}
+        config = ConfigParser.ConfigParser()
+        try:
+            config.read(CONFIG_PATH)
+        except:
+           msgerr = "cannot find this file %s" % CONFIG_PATH
+           return False, msgerr
+
+        for section in config.sections():
+            configInfo[section] = {}
+
+        for section in config.sections():
+            for option in config.options(section):
+                configInfo[section][option] = config.get(section, option)
+
+        if configInfo:
+            try:
+                # FIXME
+                self.access_key = configInfo["Credentials"]["access_key"]
+                self.secret_key = configInfo["Credentials"]["secret_key"]
+                self.token = ""
+            finally:
+                return True
+        else:
+            msgerr = "empty file %s" % CONFIG_PATH
+            return False
+
+    def get_credentials_from_iamrole(self):
         """Read IAM credentials from AWS metadata store.
         Note: This method should be explicitly called after constructing new
               object, as in 'explicit is better than implicit'.
@@ -142,13 +184,8 @@ class S3Grabber(object):
             if response:
                 response.close()
 
-        self.access_key = data['AccessKeyId']
-        self.secret_key = data['SecretAccessKey']
-        self.token = data['Token']
-
     def _request(self, baseurl, path):
-        path_enc = urllib2.quote(path)
-        url = urlparse.urljoin(baseurl, path_enc)
+        url = urlparse.urljoin(baseurl, path)
         request = urllib2.Request(url)
         request.add_header('x-amz-security-token', self.token)
         signature = self.sign(request)
@@ -165,7 +202,6 @@ class S3Grabber(object):
                 filename = request.get_selector()
                 if filename.startswith('/'):
                     filename = filename[1:]
-            
             response = None
             try:
                 out = open(filename, 'w+')
@@ -180,7 +216,8 @@ class S3Grabber(object):
                 if response:
                     response.close()
                 out.close()
-            print os.path.basename(filename)
+            if not ".xml" in filename:
+                print os.path.basename(filename)
             return filename
 
     def urlopen(self, url, **kwargs):

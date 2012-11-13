@@ -1,5 +1,5 @@
 Name:		yum-s3-plugin
-Version:        0.4.0
+Version:        0.5.0
 Release:	1
 Summary:	Amazon S3 Plugin for Yum
 License:	Apache License 2.0
@@ -18,6 +18,9 @@ find .
 %install
 rm -rf "${RPM_BUILD_ROOT}"
 
+mkdir -p ${RPM_BUILD_ROOT}/etc/
+cp -v src/s3yum.cfg ${RPM_BUILD_ROOT}/etc/
+
 mkdir -p ${RPM_BUILD_ROOT}/etc/yum.repos.d/
 cp -v src/s3iam.repo ${RPM_BUILD_ROOT}/etc/yum.repos.d/
 
@@ -35,6 +38,7 @@ find /usr/lib/yum-plugins/ -name "s3iam.py*" | xargs rm -fv
 
 %files
 %defattr(-,root,root,-)
+/etc/s3yum.cfg
 /etc/yum.repos.d/s3iam.repo
 /etc/yum/pluginconf.d/s3iam.conf
 /usr/lib/yum-plugins/s3iam.py

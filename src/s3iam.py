@@ -184,6 +184,10 @@ class S3Grabber(object):
             if response:
                 response.close()
 
+        self.access_key = data['AccessKeyId']
+        self.secret_key = data['SecretAccessKey']
+        self.token = data['Token']
+
     def _request(self, baseurl, path):
         path_enc = urllib2.quote(path)
         url = urlparse.urljoin(baseurl, path_enc)

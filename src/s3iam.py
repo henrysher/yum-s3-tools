@@ -185,7 +185,8 @@ class S3Grabber(object):
                 response.close()
 
     def _request(self, baseurl, path):
-        url = urlparse.urljoin(baseurl, path)
+        path_enc = urllib2.quote(path)
+        url = urlparse.urljoin(baseurl, path_enc)
         request = urllib2.Request(url)
         request.add_header('x-amz-security-token', self.token)
         signature = self.sign(request)

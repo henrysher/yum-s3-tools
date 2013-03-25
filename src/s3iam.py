@@ -61,7 +61,7 @@ def init_hook(conduit):
             new_repo = S3Repository(repo.id, repo.baseurl)
             new_repo.name = repo.name
             new_repo.basecachedir = repo.basecachedir
-            #new_repo.base_persistdir = repo.base_persistdir
+            new_repo.base_persistdir = repo.base_persistdir
             new_repo.gpgcheck = repo.gpgcheck
             new_repo.proxy = repo.proxy
             new_repo.enablegroups = repo.enablegroups

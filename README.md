@@ -41,3 +41,7 @@ Apache 2.0 license. See LICENSE.
 - Julius Seporaitis
 - [Robert Melas' code](https://github.com/rmela/yum-s3-plugin/) was
   used as a reference. See NOTICE.
+
+
+[![Bitdeli Badge](https://d2weczhvl823v0.cloudfront.net/henrysher/yum-s3-iam/trend.png)](https://bitdeli.com/free "Bitdeli Badge")
+

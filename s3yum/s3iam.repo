@@ -21,5 +21,4 @@ baseurl=https://your-bucket-name-1.s3.amazonaws.com/repo-name/arch/
         https://your-bucket-name-2.s3.amazonaws.com/repo-name/arch/
 failovermethod=priority
 enabled=1
-s3_enabled=1
 gpgcheck=0

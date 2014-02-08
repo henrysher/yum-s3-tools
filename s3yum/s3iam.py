@@ -48,8 +48,18 @@ plugin_type = yum.plugins.TYPE_CORE
 CONDUIT = None
 
 
-def config_hook(conduit):
-    yum.config.RepoConf.s3_enabled = yum.config.BoolOption(False)
+def _check_s3_urls(urls):
+    pattern = "s3.*\.amazonaws\.com"
+    if isinstance(urls, basestring):
+        if re.compile(pattern).findall(urls) != []:
+            return True
+    elif isinstance(urls, list):
+        for url in urls:
+            if re.compile(pattern).findall(url) == []:
+                break
+        else:
+            return True
+    return False
 
 
 def init_hook(conduit):
@@ -57,7 +67,9 @@ def init_hook(conduit):
 
     repos = conduit.getRepos()
     for key, repo in repos.repos.iteritems():
-        if isinstance(repo, YumRepository) and repo.s3_enabled and repo.enabled:
+        if isinstance(repo, YumRepository) and repo.enabled:
+            if not _check_s3_urls(repo.baseurl):
+                continue
             new_repo = S3Repository(repo.id, repo.baseurl)
             new_repo.name = repo.name
             new_repo.basecachedir = repo.basecachedir
@@ -68,6 +80,7 @@ def init_hook(conduit):
             repos.delete(key)
             repos.add(new_repo)
 
+
 class S3Repository(YumRepository):
     """Repository object for Amazon S3, using IAM Roles."""
 
@@ -77,6 +90,8 @@ class S3Repository(YumRepository):
         self.token = None
         self.baseurl = baseurl
         self.grabber = None
+
+        # Inherited from YumRepository <-- Repository
         self.enable()
 
     @property
@@ -89,7 +104,9 @@ class S3Repository(YumRepository):
             self.grabber = S3Grabber(self)
             if not self.grabber.get_role():
                 if not self.grabber.get_credentials_from_config():
-                    raise Exception("Failed to get credentials from config file: %s" % CONFIG_PATH)
+                    raise yum.plugins.PluginYumExit("Failed to get credentials"
+                                                    " from config file:"
+                                                    " %s" % CONFIG_PATH)
             else:
                 self.grabber.get_credentials_from_iamrole()
         return self.grabber
@@ -142,8 +159,8 @@ class S3Grabber(object):
         try:
             config.read(CONFIG_PATH)
         except:
-           msgerr = "cannot find this file %s" % CONFIG_PATH
-           return False, msgerr
+            msgerr = "cannot find this file %s" % CONFIG_PATH
+            return False, msgerr
 
         for section in config.sections():
             configInfo[section] = {}
@@ -256,12 +273,15 @@ class S3Grabber(object):
 
         resource = "/%s%s" % (bucket, request.get_selector(), )
         amz_headers = 'x-amz-security-token:%s\n' % self.token
+        signdict = {'method': request.get_method(),
+                    'date': request.headers.get('Date'),
+                    'canon_amzn_headers': amz_headers,
+                    'canon_amzn_resource': resource}
+
         sigstring = ("%(method)s\n\n\n%(date)s\n"
-                     "%(canon_amzn_headers)s%(canon_amzn_resource)s") % ({
-                         'method': request.get_method(),
-                         'date': request.headers.get('Date'),
-                         'canon_amzn_headers': amz_headers,
-                         'canon_amzn_resource': resource})
+                     "%(canon_amzn_headers)s"
+                     "%(canon_amzn_resource)s") % (signdict)
+
         digest = hmac.new(
             str(self.secret_key),
             str(sigstring),

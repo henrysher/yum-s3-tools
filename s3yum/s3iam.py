@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import base64
 import json
+import re
 
 import yum
 import yum.config

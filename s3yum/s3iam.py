@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import re
+import socket
 import time
 import urllib2
 import urlparse
@@ -39,6 +40,46 @@ requires_api_version = '2.5'
 plugin_type = yum.plugins.TYPE_CORE
 
 
+class CredentialError(Exception):
+
+    """
+    Credential Error"
+    """
+    pass
+
+
+def _read_config(config_path=CONFIG_PATH):
+    """
+    Read from local configuration file.
+    """
+    global TIMEOUT, RETRIES, SERVER
+
+    config = ConfigParser.SafeConfigParser()
+    try:
+        config.read(config_path)
+    except Exception as e:
+        # print "Fail to read the configuration file: %s" % config_path
+        return None
+
+    # FIXME: dirty code here
+    try:
+        TIMEOUT = config.get("Metadata", "timeout", 60)
+    except ConfigParser.Error as e:
+        TIMEOUT = 60
+
+    try:
+        RETRIES = config.get("Metadata", "retries", 5)
+    except ConfigParser.Error as e:
+        RETRIES = 5
+
+    try:
+        SERVER = config.get("Metadata", "server", "http://169.254.169.254")
+    except ConfigParser.Error as e:
+        SERVER = "http://169.254.169.254"
+
+_read_config()
+
+
 def _check_s3_urls(urls):
     pattern = "s3.*\.amazonaws\.com"
     if isinstance(urls, basestring):
@@ -53,45 +94,206 @@ def _check_s3_urls(urls):
     return False
 
 
+def retry_url(url, retry_on_404=False, num_retries=RETRIES, timeout=TIMEOUT):
+    """
+    Retry a url.  This is specifically used for accessing the metadata
+    service on an instance.  Since this address should never be proxied
+    (for security reasons), we create a ProxyHandler with a NULL
+    dictionary to override any proxy settings in the environment.
+    """
+
+    original = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+
+    for i in range(0, num_retries):
+        try:
+            proxy_handler = urllib2.ProxyHandler({})
+            opener = urllib2.build_opener(proxy_handler)
+            req = urllib2.Request(url)
+            r = opener.open(req)
+            result = r.read()
+            return result
+        except urllib2.HTTPError as e:
+            # in 2.6 you use getcode(), in 2.5 and earlier you use code
+            if hasattr(e, 'getcode'):
+                code = e.getcode()
+            else:
+                code = e.code
+            if code == 404 and not retry_on_404:
+                return None
+        except Exception as e:
+            pass
+        print '[ERROR] Caught exception reading instance data'
+        # If not on the last iteration of the loop then sleep.
+        if i + 1 != num_retries:
+            time.sleep(2 ** i)
+    print '[ERROR] Unable to read instance data, giving up'
+    return None
+
+
+def get_iam_role(url=SERVER, version="latest",
+                 params="meta-data/iam/security-credentials/"):
+    """
+    Read IAM role from AWS metadata store.
+    """
+    url = urlparse.urljoin(
+        url,
+        version,
+        params
+    )
+    result = retry_url(url)
+    if result is None:
+        # print "No IAM role found in the machine"
+        return None
+    else:
+        return result
+
+
+def get_credentials_from_iam_role(url=SERVER,
+                                  version="latest",
+                                  params="meta-data/iam/security-credentials/",
+                                  iam_role=None):
+    """
+    Read IAM credentials from AWS metadata store.
+    """
+    url = urlparse.urljoin(
+        url,
+        version,
+        params,
+        iam_role
+    )
+    result = retry_url(url)
+    if result is None:
+        # print "No IAM credentials found in the machine"
+        return None
+    try:
+        data = json.loads(result)
+    except ValueError as e:
+        # print "Corrupt data found in IAM credentials"
+        return None
+
+    access_key = data.get('AccessKeyId', None)
+    secret_key = data.get('SecretAccessKey', None)
+    token = data.get('Token', None)
+
+    if access_key and secret_key and token:
+        return (access_key, secret_key, token)
+    else:
+        return None
+
+
+def get_credentials_from_config(config_path=CONFIG_PATH):
+    """
+    Read S3 credentials from local configuration file.
+    """
+    config = ConfigParser.SafeConfigParser()
+    try:
+        config.read(config_path)
+    except Exception as e:
+        # print "Fail to read the configuration file: %s" % config_path
+        return None
+    try:
+        access_key = config.get("Credentials", "access_key", None)
+        secret_key = config.get("Credentials", "secret_key", None)
+    except ConfigParser.Error as e:
+        # print "Fail to read the configuration file: %s" % config_path
+        return None
+
+    if access_key and secret_key:
+        return (access_key, secret_key, None)
+    else:
+        return None
+
+
 def init_hook(conduit):
     """
     Setup the S3 repositories
     """
+    corrupt_repos = []
+    s3_repos = {}
 
     repos = conduit.getRepos()
     for key, repo in repos.repos.iteritems():
         if isinstance(repo, YumRepository) and repo.enabled:
-            # mirrorlist with no baseurl
-            if not repo.baseurl:
-                continue
-            # non-S3 baseurl
-            if not _check_s3_urls(repo.baseurl):
-                continue
-            new_repo = S3Repository(repo.id, repo.baseurl)
-            new_repo.name = repo.name
-            new_repo.basecachedir = repo.basecachedir
-            new_repo.base_persistdir = repo.base_persistdir
-            new_repo.gpgcheck = repo.gpgcheck
-            new_repo.proxy = repo.proxy
-            new_repo.enablegroups = repo.enablegroups
-            repos.delete(key)
-            repos.add(new_repo)
+            if repo.baseurl and _check_s3_urls(repo.baseurl):
+                s3_repos.update({key: repo})
+
+    for key, repo in s3_repos.iteritems():
+        try:
+            new_repo = S3Repository(repo.id, repo, conduit)
+        except CredentialError as e:
+            # Credential Error is a general problem
+            # will affect all S3 repos
+            corrupt_repos = s3_repos.keys()
+            break
+        except Exception as e:
+            corrupt_repos.append(key)
+            continue
+
+        # Correct yum repo on S3
+        repos.delete(key)
+        repos.add(new_repo)
+
+    # Delete the incorrect yum repo on S3
+    for repo in corrupt_repos:
+        repos.delete(repo)
 
 
 class S3Repository(YumRepository):
+
     """
     Repository object for Amazon S3
     """
 
-    def __init__(self, repoid, baseurl):
+    def __init__(self, repoid, repo, conduit):
         super(S3Repository, self).__init__(repoid)
-        self.iamrole = None
-        self.token = None
-        self.baseurl = baseurl
+        self.repoid = repoid
+        self.conduit = conduit
+
+        # FIXME: dirty code here
+        self.__dict__.update(repo.__dict__)
 
         # Inherited from YumRepository <-- Repository
         self.enable()
         self.set_credentials()
+
+    def _getFile(self, url=None, relative=None, local=None,
+                 start=None, end=None,
+                 copy_local=None, checkfunc=None, text=None,
+                 reget='simple', cache=True, size=None, **kwargs):
+        """
+        Patched _getFile func via AWS S3 REST API
+        """
+        self.http_headers = self.fetch_headers(relative)
+        return super(S3Repository, self)._getFile(url, relative, local,
+                                                  start, end,
+                                                  copy_local, checkfunc, text,
+                                                  reget, cache, size, **kwargs)
+    __get = _getFile
+
+    def set_credentials(self):
+        # Fetch credentials from local config file
+        result = get_credentials_from_config()
+        if result is not None:
+            self.access_key, self.secret_key, self.token = result
+            return True
+
+        iam_role = get_iam_role()
+        if iam_role is None:
+            self.conduit.info(3, "[ERROR] No credentials in the %s "
+                                 "for the repo '%s'" % (CONFIG_PATH,
+                                                        self.repoid))
+            raise CredentialError
+
+        # Fetch credentials from iam role meta data
+        credentials = get_credentials_from_iamrole(iam_role=iam_role)
+        if credentials is None:
+            self.conduit.info(3, "[ERROR] Fail to get IAM credentials"
+                                 "for the repo '%s'" % self.repoid)
+            raise CredentialError
+
+        self.access_key, self.secret_key, self.token = credentials
+        return True
 
     def fetch_headers(self, path):
         headers = {}
@@ -99,6 +301,8 @@ class S3Repository(YumRepository):
             headers.update({'x-amz-security-token': self.token})
         date = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
         headers.update({'Date': date})
+
+        # FIXME: need to support "mirrorlist" and multiple baseurls
         url = urlparse.urljoin(self.baseurl[0], path)
         signature = self.sign(url, date)
         headers.update({'Authorization':
@@ -115,15 +319,8 @@ class S3Repository(YumRepository):
         # http://s3.amazonaws.com/bucket/
         host = urlparse.urlparse(url).netloc
         url = urlparse.urlparse(url).path
-        try:
-            pos = host.find(".s3")
-            assert pos != -1
-            bucket = host[:pos]
-        except AssertionError:
-            raise yum.plugins.PluginYumExit(
-                "s3iam: baseurl hostname should be in format: "
-                "'<bucket>.s3<aws-region>.amazonaws.com'; "
-                "found '%s'" % host)
+        pos = host.find(".s3")
+        bucket = host[:pos]
 
         resource = "/%s%s" % (bucket, url)
         if self.token is not None:
@@ -147,103 +344,6 @@ class S3Repository(YumRepository):
             hashlib.sha1).digest()
         signature = digest.encode('base64')
         return signature
-
-    def set_credentials(self):
-        if not self.get_credentials_from_config():
-            if not self.get_role():
-                raise Exception("Failed to get credentials from" +
-                                " IAM Role or config file: %s"
-                                % CONFIG_PATH)
-            else:
-                self.get_credentials_from_iamrole()
-
-    def get_role(self):
-        """Read IAM role from AWS metadata store."""
-        request = urllib2.Request(
-            urlparse.urljoin(
-                "http://169.254.169.254",
-                "/latest/meta-data/iam/security-credentials/"
-            ))
-
-        response = None
-        try:
-            response = urllib2.urlopen(request)
-            self.iamrole = (response.read())
-        except Exception as msg:
-            if "HTTP Error 404" in msg:
-                return False
-        finally:
-            if response:
-                response.close()
-                return True
-
-    def get_credentials_from_config(self):
-        """Read S3 credentials from local configuration file.
-        Note: This method should be explicitly called after constructing new
-              object, as in 'explicit is better than implicit'.
-        """
-        configInfo = {}
-        config = ConfigParser.ConfigParser()
-        try:
-            config.read(CONFIG_PATH)
-        except:
-            msgerr = "cannot find this file %s" % CONFIG_PATH
-            return False, msgerr
-
-        for section in config.sections():
-            configInfo[section] = {}
-
-        for section in config.sections():
-            for option in config.options(section):
-                configInfo[section][option] = config.get(section, option)
-
-        if configInfo:
-            try:
-                self.access_key = configInfo["Credentials"]["access_key"]
-                self.secret_key = configInfo["Credentials"]["secret_key"]
-                self.token = None
-            finally:
-                if self.access_key and self.secret_key:
-                    return True
-        return False
-
-    def get_credentials_from_iamrole(self):
-        """Read IAM credentials from AWS metadata store.
-        Note: This method should be explicitly called after constructing new
-              object, as in 'explicit is better than implicit'.
-        """
-        request = urllib2.Request(
-            urlparse.urljoin(
-                urlparse.urljoin(
-                    "http://169.254.169.254/",
-                    "latest/meta-data/iam/security-credentials/",
-                ), self.iamrole))
-
-        response = None
-        try:
-            response = urllib2.urlopen(request)
-            data = json.loads(response.read())
-        finally:
-            if response:
-                response.close()
-
-        self.access_key = data['AccessKeyId']
-        self.secret_key = data['SecretAccessKey']
-        self.token = data['Token']
-
-    def _getFile(self, url=None, relative=None, local=None,
-                 start=None, end=None,
-                 copy_local=None, checkfunc=None, text=None,
-                 reget='simple', cache=True, size=None, **kwargs):
-        """
-        Patched _getFile func via AWS S3 REST API
-        """
-        self.http_headers = self.fetch_headers(relative)
-        return super(S3Repository, self)._getFile(url, relative, local,
-                                                  start, end,
-                                                  copy_local, checkfunc, text,
-                                                  reget, cache, size, **kwargs)
-    __get = _getFile
 
 if __name__ == '__main__':
     pass

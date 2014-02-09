@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright 2014, Henry Huang
 # Copyright 2012, Julius Seporaitis
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,40 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+__version__ = "0.0.1"
 
-__author__ = "Julius Seporaitis"
-__email__ = "julius@seporaitis.net"
-__copyright__ = "Copyright 2012, Julius Seporaitis"
-__license__ = "Apache 2.0"
-__version__ = "1.0.1"
-
-
-import os
-import sys
-import urllib2
-import urlparse
-import time
+import base64
+import ConfigParser
 import hashlib
 import hmac
-import base64
 import json
 import re
+import time
+import urllib2
+import urlparse
 
-import yum
-import yum.config
-import yum.Errors
 import yum.plugins
-
 from yum.yumRepo import YumRepository
 
 CONFIG_PATH = "/etc/s3yum.cfg"
 
-__all__ = ['requires_api_version', 'plugin_type', 'CONDUIT',
-           'config_hook', 'init_hook']
+__all__ = ['requires_api_version',
+           'plugin_type',
+           'init_hook']
 
 requires_api_version = '2.5'
 plugin_type = yum.plugins.TYPE_CORE
-CONDUIT = None
 
 
 def _check_s3_urls(urls):
@@ -64,11 +54,17 @@ def _check_s3_urls(urls):
 
 
 def init_hook(conduit):
-    """Setup the S3 repositories."""
+    """
+    Setup the S3 repositories
+    """
 
     repos = conduit.getRepos()
     for key, repo in repos.repos.iteritems():
         if isinstance(repo, YumRepository) and repo.enabled:
+            # mirrorlist with no baseurl
+            if not repo.baseurl:
+                continue
+            # non-S3 baseurl
             if not _check_s3_urls(repo.baseurl):
                 continue
             new_repo = S3Repository(repo.id, repo.baseurl)
@@ -83,7 +79,9 @@ def init_hook(conduit):
 
 
 class S3Repository(YumRepository):
-    """Repository object for Amazon S3, using IAM Roles."""
+    """
+    Repository object for Amazon S3
+    """
 
     def __init__(self, repoid, baseurl):
         super(S3Repository, self).__init__(repoid)
@@ -175,12 +173,12 @@ class S3Grabber(object):
                 # FIXME
                 self.access_key = configInfo["Credentials"]["access_key"]
                 self.secret_key = configInfo["Credentials"]["secret_key"]
-                self.token = ""
+                self.token = None
             finally:
                 return True
         else:
             msgerr = "empty file %s" % CONFIG_PATH
-            return False
+            return False, msgerr
 
     def get_credentials_from_iamrole(self):
         """Read IAM credentials from AWS metadata store.
@@ -210,7 +208,8 @@ class S3Grabber(object):
         path_enc = urllib2.quote(path)
         url = urlparse.urljoin(baseurl, path_enc)
         request = urllib2.Request(url)
-        request.add_header('x-amz-security-token', self.token)
+        if self.token is not None:
+            request.add_header('x-amz-security-token', self.token)
         signature = self.sign(request)
         request.add_header('Authorization', "AWS {0}:{1}".format(
             self.access_key,
@@ -273,15 +272,24 @@ class S3Grabber(object):
                 "found '%s'" % host)
 
         resource = "/%s%s" % (bucket, request.get_selector(), )
-        amz_headers = 'x-amz-security-token:%s\n' % self.token
-        signdict = {'method': request.get_method(),
-                    'date': request.headers.get('Date'),
-                    'canon_amzn_headers': amz_headers,
-                    'canon_amzn_resource': resource}
+        if self.token is None:
+            signdict = {'method': request.get_method(),
+                        'date': request.headers.get('Date'),
+                        'canon_amzn_resource': resource}
 
-        sigstring = ("%(method)s\n\n\n%(date)s\n"
-                     "%(canon_amzn_headers)s"
-                     "%(canon_amzn_resource)s") % (signdict)
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_resource)s") % (signdict)
+
+        else:
+            amz_headers = 'x-amz-security-token:%s\n' % self.token
+            signdict = {'method': request.get_method(),
+                        'date': request.headers.get('Date'),
+                        'canon_amzn_headers': amz_headers,
+                        'canon_amzn_resource': resource}
+
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_headers)s"
+                         "%(canon_amzn_resource)s") % (signdict)
 
         digest = hmac.new(
             str(self.secret_key),

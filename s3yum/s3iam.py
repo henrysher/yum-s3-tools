@@ -88,44 +88,74 @@ class S3Repository(YumRepository):
         self.iamrole = None
         self.token = None
         self.baseurl = baseurl
-        self.grabber = None
 
         # Inherited from YumRepository <-- Repository
         self.enable()
+        self.set_credentials()
 
-    @property
-    def grabfunc(self):
-        raise NotImplementedException("grabfunc called, when it shouldn't be!")
+    def fetch_headers(self, path):
+        headers = {}
+        if self.token is not None:
+            headers.update({'x-amz-security-token': self.token})
+        date = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+        headers.update({'Date': date})
+        url = urlparse.urljoin(self.baseurl[0], path)
+        signature = self.sign(url, date)
+        headers.update({'Authorization':
+                        "AWS {0}:{1}".format(self.access_key,
+                                             signature)})
+        return headers
 
-    @property
-    def grab(self):
-        if not self.grabber:
-            self.grabber = S3Grabber(self)
-            if not self.grabber.get_role():
-                if not self.grabber.get_credentials_from_config():
-                    raise yum.plugins.PluginYumExit("Failed to get credentials"
-                                                    " from config file:"
-                                                    " %s" % CONFIG_PATH)
-            else:
-                self.grabber.get_credentials_from_iamrole()
-        return self.grabber
-
-
-class S3Grabber(object):
-
-    def __init__(self, repo):
-        """Initialize file grabber.
-           FIXME: cannot show the correct baseurl in use.
+    def sign(self, url, date):
+        """Attach a valid S3 signature to request.
+        request - instance of Request
         """
-        if isinstance(repo.baseurl, basestring):
-            self.baseurl = [baseurl]
+        # TODO: bucket name finding is ugly, I should find a way to support
+        # both naming conventions: http://bucket.s3.amazonaws.com/ and
+        # http://s3.amazonaws.com/bucket/
+        host = urlparse.urlparse(url).netloc
+        url = urlparse.urlparse(url).path
+        try:
+            pos = host.find(".s3")
+            assert pos != -1
+            bucket = host[:pos]
+        except AssertionError:
+            raise yum.plugins.PluginYumExit(
+                "s3iam: baseurl hostname should be in format: "
+                "'<bucket>.s3<aws-region>.amazonaws.com'; "
+                "found '%s'" % host)
+
+        resource = "/%s%s" % (bucket, url)
+        if self.token is not None:
+            amz_headers = 'x-amz-security-token:%s\n' % self.token
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_headers)s"
+                         "%(canon_amzn_resource)s") % ({
+                'method': 'GET',
+                'date': date,
+                'canon_amzn_headers': amz_headers,
+                'canon_amzn_resource': resource})
         else:
-            if len(repo.baseurl) == 0:
-                raise yum.plugins.PluginYumExit("s3iam: repository '{0}' "
-                                                "must have only one "
-                                                "'baseurl' value" % repo.id)
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_resource)s") % ({
+                'method': 'GET',
+                'date': date,
+                'canon_amzn_resource': resource})
+        digest = hmac.new(
+            str(self.secret_key),
+            str(sigstring),
+            hashlib.sha1).digest()
+        signature = digest.encode('base64')
+        return signature
+
+    def set_credentials(self):
+        if not self.get_credentials_from_config():
+            if not self.get_role():
+                raise Exception("Failed to get credentials from" +
+                                " IAM Role or config file: %s"
+                                % CONFIG_PATH)
             else:
-                self.baseurl = repo.baseurl
+                self.get_credentials_from_iamrole()
 
     def get_role(self):
         """Read IAM role from AWS metadata store."""
@@ -148,11 +178,10 @@ class S3Grabber(object):
                 return True
 
     def get_credentials_from_config(self):
-        """Read S3 credentials from Local Configuration.
+        """Read S3 credentials from local configuration file.
         Note: This method should be explicitly called after constructing new
               object, as in 'explicit is better than implicit'.
         """
-        import ConfigParser
         configInfo = {}
         config = ConfigParser.ConfigParser()
         try:
@@ -170,15 +199,13 @@ class S3Grabber(object):
 
         if configInfo:
             try:
-                # FIXME
                 self.access_key = configInfo["Credentials"]["access_key"]
                 self.secret_key = configInfo["Credentials"]["secret_key"]
                 self.token = None
             finally:
-                return True
-        else:
-            msgerr = "empty file %s" % CONFIG_PATH
-            return False, msgerr
+                if self.access_key and self.secret_key:
+                    return True
+        return False
 
     def get_credentials_from_iamrole(self):
         """Read IAM credentials from AWS metadata store.
@@ -204,96 +231,19 @@ class S3Grabber(object):
         self.secret_key = data['SecretAccessKey']
         self.token = data['Token']
 
-    def _request(self, baseurl, path):
-        path_enc = urllib2.quote(path)
-        url = urlparse.urljoin(baseurl, path_enc)
-        request = urllib2.Request(url)
-        if self.token is not None:
-            request.add_header('x-amz-security-token', self.token)
-        signature = self.sign(request)
-        request.add_header('Authorization', "AWS {0}:{1}".format(
-            self.access_key,
-            signature))
-        return request
-
-    def urlgrab(self, url, filename=None, **kwargs):
-        """urlgrab(url) copy the file to the local filesystem."""
-        for baseurl in self.baseurl:
-            request = self._request(baseurl, url)
-            if filename is None:
-                filename = request.get_selector()
-                if filename.startswith('/'):
-                    filename = filename[1:]
-            response = None
-            try:
-                out = open(filename, 'w+')
-                response = urllib2.urlopen(request)
-                buff = response.read(8192)
-                while buff:
-                    out.write(buff)
-                    buff = response.read(8192)
-            except:
-                continue
-            finally:
-                if response:
-                    response.close()
-                out.close()
-            if not ".xml" in filename:
-                print os.path.basename(filename)
-            return filename
-
-    def urlopen(self, url, **kwargs):
-        """urlopen(url) open the remote file and return a file object."""
-        return urllib2.urlopen(self._request(url))
-
-    def urlread(self, url, limit=None, **kwargs):
-        """urlread(url) return the contents of the file as a string."""
-        return urllib2.urlopen(self._request(url)).read()
-
-    def sign(self, request):
-        """Attach a valid S3 signature to request.
-        request - instance of Request
+    def _getFile(self, url=None, relative=None, local=None,
+                 start=None, end=None,
+                 copy_local=None, checkfunc=None, text=None,
+                 reget='simple', cache=True, size=None, **kwargs):
         """
-        date = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
-        request.add_header('Date', date)
-        host = request.get_host()
+        Patched _getFile func via AWS S3 REST API
+        """
+        self.http_headers = self.fetch_headers(relative)
+        return super(S3Repository, self)._getFile(url, relative, local,
+                                                  start, end,
+                                                  copy_local, checkfunc, text,
+                                                  reget, cache, size, **kwargs)
+    __get = _getFile
 
-        # TODO: bucket name finding is ugly, I should find a way to support
-        # both naming conventions: http://bucket.s3.amazonaws.com/ and
-        # http://s3.amazonaws.com/bucket/
-        try:
-            pos = host.find(".s3")
-            assert pos != -1
-            bucket = host[:pos]
-        except AssertionError:
-            raise yum.plugins.PluginYumExit(
-                "s3iam: baseurl hostname should be in format: "
-                "'<bucket>.s3<aws-region>.amazonaws.com'; "
-                "found '%s'" % host)
-
-        resource = "/%s%s" % (bucket, request.get_selector(), )
-        if self.token is None:
-            signdict = {'method': request.get_method(),
-                        'date': request.headers.get('Date'),
-                        'canon_amzn_resource': resource}
-
-            sigstring = ("%(method)s\n\n\n%(date)s\n"
-                         "%(canon_amzn_resource)s") % (signdict)
-
-        else:
-            amz_headers = 'x-amz-security-token:%s\n' % self.token
-            signdict = {'method': request.get_method(),
-                        'date': request.headers.get('Date'),
-                        'canon_amzn_headers': amz_headers,
-                        'canon_amzn_resource': resource}
-
-            sigstring = ("%(method)s\n\n\n%(date)s\n"
-                         "%(canon_amzn_headers)s"
-                         "%(canon_amzn_resource)s") % (signdict)
-
-        digest = hmac.new(
-            str(self.secret_key),
-            str(sigstring),
-            hashlib.sha1).digest()
-        signature = digest.encode('base64')
-        return signature
+if __name__ == '__main__':
+    pass

@@ -1,6 +1,7 @@
 ;
-; sample s3 repository config /etc/yum.repos.d/s3test.conf
+; sample s3 repository config /etc/yum.repos.d/s3iam.conf
 ;
+; Copyright 2014, Henry Huang
 ; Copyright 2012, Julius Seporaitis
 ;
 ; Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +17,7 @@
 ; limitations under the License.
 ;
 [s3iam]
-name=S3 yum plugin test repository config
+name=yum plugin for yum repository hosted on s3
 baseurl=https://your-bucket-name-1.s3.amazonaws.com/repo-name/arch/
         https://your-bucket-name-2.s3.amazonaws.com/repo-name/arch/
 failovermethod=priority

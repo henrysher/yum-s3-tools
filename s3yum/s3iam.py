@@ -17,7 +17,6 @@
 __version__ = "0.0.1"
 
 import base64
-import ConfigParser
 import hashlib
 import hmac
 import json
@@ -30,14 +29,16 @@ import urlparse
 import yum.plugins
 from yum.yumRepo import YumRepository
 
-CONFIG_PATH = "/etc/s3yum.cfg"
-
 __all__ = ['requires_api_version',
            'plugin_type',
            'init_hook']
 
 requires_api_version = '2.5'
 plugin_type = yum.plugins.TYPE_CORE
+
+timeout = 60
+retries = 5
+metadata_server = "http://169.254.169.254"
 
 
 class CredentialError(Exception):
@@ -46,38 +47,6 @@ class CredentialError(Exception):
     Credential Error"
     """
     pass
-
-
-def _read_config(config_path=CONFIG_PATH):
-    """
-    Read from local configuration file.
-    """
-    global TIMEOUT, RETRIES, SERVER
-
-    config = ConfigParser.SafeConfigParser()
-    try:
-        config.read(config_path)
-    except Exception as e:
-        # print "Fail to read the configuration file: %s" % config_path
-        return None
-
-    # FIXME: dirty code here
-    try:
-        TIMEOUT = config.get("Metadata", "timeout", 60)
-    except ConfigParser.Error as e:
-        TIMEOUT = 60
-
-    try:
-        RETRIES = config.get("Metadata", "retries", 5)
-    except ConfigParser.Error as e:
-        RETRIES = 5
-
-    try:
-        SERVER = config.get("Metadata", "server", "http://169.254.169.254")
-    except ConfigParser.Error as e:
-        SERVER = "http://169.254.169.254"
-
-_read_config()
 
 
 def _check_s3_urls(urls):
@@ -94,7 +63,7 @@ def _check_s3_urls(urls):
     return False
 
 
-def retry_url(url, retry_on_404=False, num_retries=RETRIES, timeout=TIMEOUT):
+def retry_url(url, retry_on_404=False, num_retries=retries, timeout=timeout):
     """
     Retry a url.  This is specifically used for accessing the metadata
     service on an instance.  Since this address should never be proxied
@@ -131,7 +100,7 @@ def retry_url(url, retry_on_404=False, num_retries=RETRIES, timeout=TIMEOUT):
     return None
 
 
-def get_iam_role(url=SERVER, version="latest",
+def get_iam_role(url=metadata_server, version="latest",
                  params="meta-data/iam/security-credentials/"):
     """
     Read IAM role from AWS metadata store.
@@ -149,7 +118,7 @@ def get_iam_role(url=SERVER, version="latest",
         return result
 
 
-def get_credentials_from_iam_role(url=SERVER,
+def get_credentials_from_iam_role(url=metadata_server,
                                   version="latest",
                                   params="meta-data/iam/security-credentials/",
                                   iam_role=None):
@@ -178,29 +147,6 @@ def get_credentials_from_iam_role(url=SERVER,
 
     if access_key and secret_key and token:
         return (access_key, secret_key, token)
-    else:
-        return None
-
-
-def get_credentials_from_config(config_path=CONFIG_PATH):
-    """
-    Read S3 credentials from local configuration file.
-    """
-    config = ConfigParser.SafeConfigParser()
-    try:
-        config.read(config_path)
-    except Exception as e:
-        # print "Fail to read the configuration file: %s" % config_path
-        return None
-    try:
-        access_key = config.get("Credentials", "access_key", None)
-        secret_key = config.get("Credentials", "secret_key", None)
-    except ConfigParser.Error as e:
-        # print "Fail to read the configuration file: %s" % config_path
-        return None
-
-    if access_key and secret_key:
-        return (access_key, secret_key, None)
     else:
         return None
 
@@ -272,17 +218,27 @@ class S3Repository(YumRepository):
     __get = _getFile
 
     def set_credentials(self):
+
+        # Fetch params from local config file
+        global timeout, retries, metadata_server
+        timeout = self.conduit.confInt('aws', 'timeout', default=timeout)
+        retries = self.conduit.confInt('aws', 'retries', default=retries)
+        metadata_server = self.conduit.confString(
+            'aws', 'metadata_server', default=metadata_server)
+
         # Fetch credentials from local config file
-        result = get_credentials_from_config()
-        if result is not None:
-            self.access_key, self.secret_key, self.token = result
+        self.access_key = self.conduit.confString(
+            'aws', 'access_key', default=None)
+        self.secret_key = self.conduit.confString(
+            'aws', 'secret_key', default=None)
+        self.token = self.conduit.confString('aws', 'token', default=None)
+        if self.access_key and self.secret_key:
             return True
 
         iam_role = get_iam_role()
         if iam_role is None:
-            self.conduit.info(3, "[ERROR] No credentials in the %s "
-                                 "for the repo '%s'" % (CONFIG_PATH,
-                                                        self.repoid))
+            self.conduit.info(3, "[ERROR] No credentials in the plugin conf "
+                                 "for the repo '%s'" % self.repoid)
             raise CredentialError
 
         # Fetch credentials from iam role meta data

@@ -237,7 +237,11 @@ class S3Repository(YumRepository):
 
         iam_role = get_iam_role()
         if iam_role is None:
+<<<<<<< HEAD
             self.conduit.info(3, "[ERROR] No credentials in the plugin conf "
+=======
+            self.conduit.info(3, "[ERROR] No credentials in the plugin conf"
+>>>>>>> 738e91ee7085f90230ea6c40c9a592e374cbc3ac
                                  "for the repo '%s'" % self.repoid)
             raise CredentialError
 

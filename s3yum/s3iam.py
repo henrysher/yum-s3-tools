@@ -56,11 +56,12 @@ def _check_s3_urls(urls):
             return True
     elif isinstance(urls, list):
         for url in urls:
-            if re.compile(pattern).findall(url) == []:
+            if re.compile(pattern).findall(url) != []:
                 break
         else:
-            return True
-    return False
+            # Only for the list with all non-S3 URLs
+            return False
+    return True
 
 
 def retry_url(url, retry_on_404=False, num_retries=retries, timeout=timeout):
@@ -210,11 +211,28 @@ class S3Repository(YumRepository):
         """
         Patched _getFile func via AWS S3 REST API
         """
-        self.http_headers = self.fetch_headers(relative)
-        return super(S3Repository, self)._getFile(url, relative, local,
-                                                  start, end,
-                                                  copy_local, checkfunc, text,
-                                                  reget, cache, size, **kwargs)
+        mirrors = self.grab.mirrors
+        # mirrors always exists as a list
+        # and each element (dict) with a key named "mirror"
+        for mirror in mirrors:
+            baseurl = mirror["mirror"]
+            super(S3Repository, self).grab.mirrors = [mirror]
+            if _check_s3_urls(baseurl):
+                self.http_headers = self.fetch_headers(baseurl, relative)
+            else:
+                # non-S3 URL
+                self.http_headers = tuple(
+                    self.__headersListFromDict(cache=cache))
+            try:
+                return super(S3Repository, self)._getFile(url, relative, local,
+                                                          start, end,
+                                                          copy_local,
+                                                          checkfunc, text,
+                                                          reget, cache,
+                                                          size, **kwargs)
+            except Exception as e:
+                self.conduit.info(3, str(e))
+
     __get = _getFile
 
     def set_credentials(self):
@@ -251,7 +269,7 @@ class S3Repository(YumRepository):
         self.access_key, self.secret_key, self.token = credentials
         return True
 
-    def fetch_headers(self, path):
+    def fetch_headers(self, url, path):
         headers = {}
         if self.token is not None:
             headers.update({'x-amz-security-token': self.token})
@@ -259,7 +277,7 @@ class S3Repository(YumRepository):
         headers.update({'Date': date})
 
         # FIXME: need to support "mirrorlist" and multiple baseurls
-        url = urlparse.urljoin(self.baseurl[0], path)
+        url = urlparse.urljoin(url, path)
         signature = self.sign(url, date)
         headers.update({'Authorization':
                         "AWS {0}:{1}".format(self.access_key,

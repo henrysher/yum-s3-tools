@@ -260,7 +260,7 @@ class S3Repository(YumRepository):
             raise CredentialError
 
         # Fetch credentials from iam role meta data
-        credentials = get_credentials_from_iamrole(iam_role=iam_role)
+        credentials = get_credentials_from_iam_role(iam_role=iam_role)
         if credentials is None:
             self.conduit.info(3, "[ERROR] Fail to get IAM credentials"
                                  "for the repo '%s'" % self.repoid)

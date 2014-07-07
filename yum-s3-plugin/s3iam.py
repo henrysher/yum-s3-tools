@@ -106,11 +106,7 @@ def get_iam_role(url=metadata_server, version="latest",
     """
     Read IAM role from AWS metadata store.
     """
-    url = urlparse.urljoin(
-        url,
-        version,
-        params
-    )
+    url = urlparse.urljoin(url, "/".join([version, params]))
     result = retry_url(url)
     if result is None:
         # print "No IAM role found in the machine"
@@ -126,12 +122,7 @@ def get_credentials_from_iam_role(url=metadata_server,
     """
     Read IAM credentials from AWS metadata store.
     """
-    url = urlparse.urljoin(
-        url,
-        version,
-        params,
-        iam_role
-    )
+    url = urlparse.urljoin(url, "/".join([version, params, iam_role]))
     result = retry_url(url)
     if result is None:
         # print "No IAM credentials found in the machine"

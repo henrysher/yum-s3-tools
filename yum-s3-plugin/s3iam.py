@@ -17,14 +17,18 @@
 __version__ = "0.0.1"
 
 import base64
-import hashlib
 import hmac
 import json
 import re
 import socket
+import datetime
 import time
 import urllib2
 import urlparse
+from hashlib import sha256
+from email.message import Message
+from urllib2 import quote
+from urlparse import urlsplit
 
 import yum.plugins
 from yum.yumRepo import YumRepository
@@ -39,6 +43,24 @@ plugin_type = yum.plugins.TYPE_CORE
 timeout = 60
 retries = 5
 metadata_server = "http://169.254.169.254"
+EMPTY_SHA256_HASH = (
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+
+
+class HTTPHeaders(Message):
+
+    # The __iter__ method is not available in python2.x, so we have
+    # to port the py3 version.
+    def __iter__(self):
+        for field, value in self._headers:
+            yield field
+
+
+class NoCredentialsError(Exception):
+    """
+    No credentials could be found
+    """
+    pass
 
 
 class CredentialError(Exception):
@@ -47,6 +69,181 @@ class CredentialError(Exception):
     Credential Error"
     """
     pass
+
+
+class Credentials(object):
+    def __init__(self, access_key, secret_key, token):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.token = token
+
+
+class HTTPRequest(object):
+    def __init__(self, method, url, headers=None):
+        self.method = method
+        self.url = url
+
+        if headers is None:
+            self.headers = {}
+        else:
+            self.headers = headers
+
+
+class BaseSigner(object):
+    REQUIRES_REGION = False
+
+    def add_auth(self, request):
+        raise NotImplementedError("add_auth")
+
+
+class S3SigV4Auth(BaseSigner):
+    """
+    Sign a S3 request with Signature V4.
+    """
+    REQUIRES_REGION = True
+
+    def __init__(self, credentials, service_name, region_name, logger):
+        self.credentials = credentials
+        # We initialize these value here so the unit tests can have
+        # valid values.  But these will get overriden in ``add_auth``
+        # later for real requests.
+        now = datetime.datetime.utcnow()
+        self.timestamp = now.strftime('%Y%m%dT%H%M%SZ')
+        self._region_name = region_name
+        self._service_name = service_name
+        self._logger = logger
+
+    def _sign(self, key, msg, hex=False):
+        if hex:
+            sig = hmac.new(key, msg.encode('utf-8'), sha256).hexdigest()
+        else:
+            sig = hmac.new(key, msg.encode('utf-8'), sha256).digest()
+        return sig
+
+    def headers_to_sign(self, request):
+        """
+        Select the headers from the request that need to be included
+        in the StringToSign.
+        """
+        header_map = HTTPHeaders()
+        split = urlsplit(request.url)
+        for name, value in request.headers.items():
+            lname = name.lower()
+            header_map[lname] = value
+        if 'host' not in header_map:
+            header_map['host'] = split.netloc
+        return header_map
+
+    def canonical_headers(self, headers_to_sign):
+        """
+        Return the headers that need to be included in the StringToSign
+        in their canonical form by converting all header keys to lower
+        case, sorting them in alphabetical order and then joining
+        them into a string, separated by newlines.
+        """
+        headers = []
+        sorted_header_names = sorted(set(headers_to_sign))
+        for key in sorted_header_names:
+            value = ','.join(v.strip() for v in
+                             sorted(headers_to_sign.get_all(key)))
+            headers.append('%s:%s' % (key, value))
+        return '\n'.join(headers)
+
+    def signed_headers(self, headers_to_sign):
+        l = ['%s' % n.lower().strip() for n in set(headers_to_sign)]
+        l = sorted(l)
+        return ';'.join(l)
+
+    def canonical_request(self, request):
+        cr = [request.method.upper()]
+        path = self._normalize_url_path(urlsplit(request.url).path)
+        cr.append(path)
+        headers_to_sign = self.headers_to_sign(request)
+        cr.append(self.canonical_headers(headers_to_sign) + '\n')
+        cr.append(self.signed_headers(headers_to_sign))
+        if 'X-Amz-Content-SHA256' in request.headers:
+            body_checksum = request.headers['X-Amz-Content-SHA256']
+        else:
+            body_checksum = EMPTY_SHA256_HASH
+        cr.append(body_checksum)
+        return '\n'.join(cr)
+
+    def _normalize_url_path(self, path):
+        # For S3, we do not normalize the path.
+        return path
+
+    def scope(self, args):
+        scope = [self.credentials.access_key]
+        scope.append(self.timestamp[0:8])
+        scope.append(self._region_name)
+        scope.append(self._service_name)
+        scope.append('aws4_request')
+        return '/'.join(scope)
+
+    def credential_scope(self, args):
+        scope = []
+        scope.append(self.timestamp[0:8])
+        scope.append(self._region_name)
+        scope.append(self._service_name)
+        scope.append('aws4_request')
+        return '/'.join(scope)
+
+    def string_to_sign(self, request, canonical_request):
+        """
+        Return the canonical StringToSign as well as a dict
+        containing the original version of all headers that
+        were included in the StringToSign.
+        """
+        sts = ['AWS4-HMAC-SHA256']
+        sts.append(self.timestamp)
+        sts.append(self.credential_scope(request))
+        sts.append(sha256(canonical_request.encode('utf-8')).hexdigest())
+        return '\n'.join(sts)
+
+    def signature(self, string_to_sign):
+        key = self.credentials.secret_key
+        k_date = self._sign(('AWS4' + key).encode('utf-8'),
+                            self.timestamp[0:8])
+        k_region = self._sign(k_date, self._region_name)
+        k_service = self._sign(k_region, self._service_name)
+        k_signing = self._sign(k_service, 'aws4_request')
+        return self._sign(k_signing, string_to_sign, hex=True)
+
+    def add_auth(self, request):
+        if self.credentials is None:
+            raise NoCredentialsError
+        # Create a new timestamp for each signing event
+        now = datetime.datetime.utcnow()
+        self.timestamp = now.strftime('%Y%m%dT%H%M%SZ')
+        # This could be a retry.  Make sure the previous
+        # authorization header is removed first.
+        self._modify_request_before_signing(request)
+        canonical_request = self.canonical_request(request)
+        self._logger.info(3, "Calculating signature using v4 auth.")
+        self._logger.info(3, "CanonicalRequest:\n%s\n" % canonical_request)
+        string_to_sign = self.string_to_sign(request, canonical_request)
+        self._logger.info(3, "StringToSign:\n%s\n" % string_to_sign)
+        signature = self.signature(string_to_sign)
+        self._logger.info(3, "Signature: %s" % signature)
+
+        self._inject_signature_to_request(request, signature)
+
+    def _inject_signature_to_request(self, request, signature):
+        l = ['AWS4-HMAC-SHA256 Credential=%s' % self.scope(request)]
+        headers_to_sign = self.headers_to_sign(request)
+        l.append('SignedHeaders=%s' % self.signed_headers(headers_to_sign))
+        l.append('Signature=%s' % signature)
+        request.headers['Authorization'] = ', '.join(l)
+        return request
+
+    def _modify_request_before_signing(self, request):
+        if 'Authorization' in request.headers:
+            del request.headers['Authorization']
+        if 'Date' not in request.headers:
+            request.headers['X-Amz-Date'] = self.timestamp
+        if self.credentials.token:
+            request.headers['X-Amz-Security-Token'] = self.credentials.token
+        request.headers['X-Amz-Content-SHA256'] = EMPTY_SHA256_HASH
 
 
 def _check_s3_urls(urls):
@@ -101,6 +298,16 @@ def retry_url(url, retry_on_404=False, num_retries=retries, timeout=timeout):
     return None
 
 
+def get_region(url=metadata_server, version="latest",
+               params="meta-data/placement/availability-zone/"):
+    """
+    Fetch the region from AWS metadata store.
+    """
+    url = urlparse.urljoin(url, "/".join([version, params]))
+    result = retry_url(url)
+    return result[:-1].strip()
+
+
 def get_iam_role(url=metadata_server, version="latest",
                  params="meta-data/iam/security-credentials/"):
     """
@@ -138,7 +345,9 @@ def get_credentials_from_iam_role(url=metadata_server,
     token = data.get('Token', None)
 
     if access_key and secret_key and token:
-        return (access_key, secret_key, token)
+        return (access_key.encode("utf-8"),
+                secret_key.encode("utf-8"),
+                token.encode("utf-8"))
     else:
         return None
 
@@ -223,6 +432,7 @@ class S3Repository(YumRepository):
                                                           size, **kwargs)
             except Exception as e:
                 self.conduit.info(3, str(e))
+                raise
 
     __get = _getFile
 
@@ -262,53 +472,14 @@ class S3Repository(YumRepository):
 
     def fetch_headers(self, url, path):
         headers = {}
-        if self.token is not None:
-            headers.update({'x-amz-security-token': self.token})
-        date = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
-        headers.update({'Date': date})
 
-        # FIXME: need to support "mirrorlist" and multiple baseurls
-        url = urlparse.urljoin(url, path)
-        signature = self.sign(url, date)
-        headers.update({'Authorization':
-                        "AWS {0}:{1}".format(self.access_key,
-                                             signature)})
-        return headers
+        url = urlparse.urljoin(url, path) + "\n"
+        credentials = Credentials(self.access_key, self.secret_key, self.token)
+        request = HTTPRequest("GET", url)
+        signer = S3SigV4Auth(credentials, "s3", get_region(), self.conduit)
+        signer.add_auth(request)
+        return request.headers
 
-    def sign(self, url, date):
-        """Attach a valid S3 signature to request.
-        request - instance of Request
-        """
-        # TODO: bucket name finding is ugly, I should find a way to support
-        # both naming conventions: http://bucket.s3.amazonaws.com/ and
-        # http://s3.amazonaws.com/bucket/
-        host = urlparse.urlparse(url).netloc
-        url = urlparse.urlparse(url).path
-        pos = host.find(".s3")
-        bucket = host[:pos]
-
-        resource = "/%s%s" % (bucket, url)
-        if self.token is not None:
-            amz_headers = 'x-amz-security-token:%s\n' % self.token
-            sigstring = ("%(method)s\n\n\n%(date)s\n"
-                         "%(canon_amzn_headers)s"
-                         "%(canon_amzn_resource)s") % ({
-                'method': 'GET',
-                'date': date,
-                'canon_amzn_headers': amz_headers,
-                'canon_amzn_resource': resource})
-        else:
-            sigstring = ("%(method)s\n\n\n%(date)s\n"
-                         "%(canon_amzn_resource)s") % ({
-                'method': 'GET',
-                'date': date,
-                'canon_amzn_resource': resource})
-        digest = hmac.new(
-            str(self.secret_key),
-            str(sigstring),
-            hashlib.sha1).digest()
-        signature = digest.encode('base64')
-        return signature
 
 if __name__ == '__main__':
     pass

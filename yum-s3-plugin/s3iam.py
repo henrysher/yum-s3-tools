@@ -27,7 +27,6 @@ import urllib2
 import urlparse
 from hashlib import sha256
 from email.message import Message
-from urllib2 import quote
 from urlparse import urlsplit
 
 import yum.plugins
@@ -43,6 +42,7 @@ plugin_type = yum.plugins.TYPE_CORE
 timeout = 60
 retries = 5
 metadata_server = "http://169.254.169.254"
+
 EMPTY_SHA256_HASH = (
     'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
 
@@ -63,10 +63,10 @@ class NoCredentialsError(Exception):
     pass
 
 
-class CredentialError(Exception):
+class IncorrectCredentialsError(Exception):
 
     """
-    Credential Error"
+    Incorrect Credentials could be found"
     """
     pass
 
@@ -90,8 +90,6 @@ class HTTPRequest(object):
 
 
 class BaseSigner(object):
-    REQUIRES_REGION = False
-
     def add_auth(self, request):
         raise NotImplementedError("add_auth")
 
@@ -100,8 +98,6 @@ class S3SigV4Auth(BaseSigner):
     """
     Sign a S3 request with Signature V4.
     """
-    REQUIRES_REGION = True
-
     def __init__(self, credentials, service_name, region_name, logger):
         self.credentials = credentials
         # We initialize these value here so the unit tests can have
@@ -368,7 +364,7 @@ def init_hook(conduit):
     for key, repo in s3_repos.iteritems():
         try:
             new_repo = S3Repository(repo.id, repo, conduit)
-        except CredentialError as e:
+        except IncorrectCredentialsError as e:
             # Credential Error is a general problem
             # will affect all S3 repos
             corrupt_repos = s3_repos.keys()
@@ -442,30 +438,33 @@ class S3Repository(YumRepository):
         global timeout, retries, metadata_server
         timeout = self.conduit.confInt('aws', 'timeout', default=timeout)
         retries = self.conduit.confInt('aws', 'retries', default=retries)
-        metadata_server = self.conduit.confString(
-            'aws', 'metadata_server', default=metadata_server)
+        metadata_server = self.conduit.confString('aws',
+                                                  'metadata_server',
+                                                  default=metadata_server)
 
         # Fetch credentials from local config file
-        self.access_key = self.conduit.confString(
-            'aws', 'access_key', default=None)
-        self.secret_key = self.conduit.confString(
-            'aws', 'secret_key', default=None)
+        self.access_key = self.conduit.confString('aws',
+                                                  'access_key',
+                                                  default=None)
+        self.secret_key = self.conduit.confString('aws',
+                                                  'secret_key',
+                                                  default=None)
         self.token = self.conduit.confString('aws', 'token', default=None)
         if self.access_key and self.secret_key:
             return True
 
+        # Fetch credentials from iam role meta data
         iam_role = get_iam_role()
         if iam_role is None:
             self.conduit.info(3, "[ERROR] No credentials in the plugin conf "
                                  "for the repo '%s'" % self.repoid)
-            raise CredentialError
+            raise IncorrectCredentialsError
 
-        # Fetch credentials from iam role meta data
         credentials = get_credentials_from_iam_role(iam_role=iam_role)
         if credentials is None:
             self.conduit.info(3, "[ERROR] Fail to get IAM credentials"
                                  "for the repo '%s'" % self.repoid)
-            raise CredentialError
+            raise IncorrectCredentialsError
 
         self.access_key, self.secret_key, self.token = credentials
         return True
@@ -473,6 +472,7 @@ class S3Repository(YumRepository):
     def fetch_headers(self, url, path):
         headers = {}
 
+        # "\n" in the url, required by AWS S3 Auth v4
         url = urlparse.urljoin(url, path) + "\n"
         credentials = Credentials(self.access_key, self.secret_key, self.token)
         request = HTTPRequest("GET", url)

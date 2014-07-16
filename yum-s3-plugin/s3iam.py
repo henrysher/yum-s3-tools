@@ -28,6 +28,7 @@ import urlparse
 from hashlib import sha256
 from email.message import Message
 from urlparse import urlsplit
+from urllib import quote
 
 import yum.plugins
 from yum.yumRepo import YumRepository
@@ -473,7 +474,7 @@ class S3Repository(YumRepository):
         headers = {}
 
         # "\n" in the url, required by AWS S3 Auth v4
-        url = urlparse.urljoin(url, path) + "\n"
+        url = quote(urlparse.urljoin(url, path)) + "\n"
         credentials = Credentials(self.access_key, self.secret_key, self.token)
         request = HTTPRequest("GET", url)
         signer = S3SigV4Auth(credentials, "s3", get_region(), self.conduit)
